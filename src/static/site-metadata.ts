@@ -11,7 +11,7 @@ interface ISiteMetadataResult {
 }
 
 const data: ISiteMetadataResult = {
-  siteTitle: 'Qinxi's Workouts Map',
+  siteTitle: 'Qinxi\'s Workouts Map',
   siteUrl: 'https://qinxi.github.io/workouts_page/',
   logo: 'https://avatars.githubusercontent.com/u/6198010?v=4',
   description: 'Personal site and blog',
@@ -19,7 +19,7 @@ const data: ISiteMetadataResult = {
   navLinks: [
     {
       name: 'Blog',
-      url: 'https://ben29.xyz',
+      url: 'https://qinxi.github.io/workouts_page/',
     },
     {
       name: 'About',
