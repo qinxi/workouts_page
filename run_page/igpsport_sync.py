@@ -21,7 +21,7 @@ from config import FIT_FOLDER, JSON_FILE, SQL_FILE
 from generator.db import Activity, init_db
 from sqlalchemy import func
 
-from utils import make_activities_file
+from generator import Generator
 
 BASE_URL = "https://prod.zh.igpsport.com/service/"
 LOGIN_URL = BASE_URL + "auth/account/login"
@@ -61,6 +61,7 @@ def seed_db(session, seed_file=SEED_FILE):
                 name=a["name"],
                 distance=a["distance"],
                 moving_time=parse_interval(a["moving_time"]),
+                elapsed_time=parse_interval(a["moving_time"]),
                 type=a["type"],
                 start_date=a["start_date"],
                 start_date_local=a["start_date_local"],
@@ -75,6 +76,26 @@ def seed_db(session, seed_file=SEED_FILE):
         added += 1
     session.commit()
     print(f"seeded {added} activities from {os.path.basename(seed_file)}")
+
+
+def drop_seed_duplicates(session, minutes=10):
+    """Remove seeded (Strava) activities that are also covered by a FIT file."""
+    rows = session.query(Activity).all()
+    fits = [
+        arrow.get(a.start_date)
+        for a in rows
+        if a.source != "strava" and a.start_date
+    ]
+    removed = 0
+    for a in rows:
+        if a.source != "strava":
+            continue
+        t = arrow.get(a.start_date)
+        if any(abs((t - f).total_seconds()) <= minutes * 60 for f in fits):
+            session.delete(a)
+            removed += 1
+    session.commit()
+    print(f"removed {removed} seeded activities duplicated by fit files")
 
 
 class IGPSport:
@@ -167,7 +188,11 @@ def main():
         time.sleep(0.5)
 
     print(f"{new_files} new fit files")
-    make_activities_file(SQL_FILE, FIT_FOLDER, JSON_FILE, "fit")
+    generator = Generator(SQL_FILE)
+    generator.sync_from_data_dir(FIT_FOLDER, file_suffix="fit")
+    drop_seed_duplicates(generator.session)
+    with open(JSON_FILE, "w") as f:
+        json.dump(generator.load(), f, indent=0)
 
 
 if __name__ == "__main__":
