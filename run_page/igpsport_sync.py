@@ -103,9 +103,17 @@ def drop_seed_duplicates(session, minutes=10):
     print(f"removed {removed} seeded activities duplicated by fit files")
 
 
-def sync_fit_tracks(session, names):
-    """Load the FIT files and save them, using the iGPSPORT titles as names."""
-    tracks = TrackLoader().load_tracks(FIT_FOLDER, file_suffix="fit")
+def sync_fit_tracks(session, names, ride_ids):
+    """Save the given FIT files, using the iGPSPORT titles as activity names."""
+    loader = TrackLoader()
+    files = [
+        os.path.join(FIT_FOLDER, f"{i}.fit")
+        for i in ride_ids
+        if os.path.exists(os.path.join(FIT_FOLDER, f"{i}.fit"))
+    ]
+    loaded = loader._load_data_tracks(files, loader.load_func_dict["fit"])
+    tracks = loader._filter_tracks(list(loaded.values()))
+    tracks = loader._merge_tracks(tracks)
     for t in tracks:
         ride_id = os.path.splitext(t.file_names[0])[0]
         t.name = names.get(ride_id) or t.name
@@ -176,28 +184,36 @@ def main():
     session = init_db(SQL_FILE)
     seed_db(session)
 
+    names = load_fit_name_mapping()
     if args.since:
         begin = args.since
     else:
-        # everything after the Strava-era history comes from iGPSPORT
-        last_seed = (
-            session.query(func.max(Activity.start_date_local))
-            .filter(Activity.source == "strava")
-            .scalar()
-        )
-        begin = (
-            arrow.get(last_seed).shift(days=-1).format("YYYY-MM-DD")
-            if last_seed
-            else ""
-        )
+        # no title mapping yet (first run or lost cache): everything after the
+        # Strava-era history; afterwards only what is newer than the last FIT
+        last = None
+        if names:
+            last = (
+                session.query(func.max(Activity.start_date_local))
+                .filter(Activity.source != "strava")
+                .scalar()
+            )
+        if not last:
+            last = (
+                session.query(func.max(Activity.start_date_local))
+                .filter(Activity.source == "strava")
+                .scalar()
+            )
+        begin = arrow.get(last).shift(days=-1).format("YYYY-MM-DD") if last else ""
     print(f"syncing iGPSPORT activities since {begin or 'the beginning'}")
 
     client = IGPSport(args.username, args.password)
-    names = load_fit_name_mapping()
+    pending = []  # rides not processed yet (new, or still without a title)
     new_files = 0
     for row in client.activities(begin_time=begin):
-        ride_id = row["rideId"]
-        names[str(ride_id)] = row.get("title") or ""
+        ride_id = str(row["rideId"])
+        if ride_id not in names:
+            pending.append(ride_id)
+        names[ride_id] = row.get("title") or ""
         path = os.path.join(FIT_FOLDER, f"{ride_id}.fit")
         if os.path.exists(path):
             continue
@@ -205,6 +221,9 @@ def main():
             client.download_fit(ride_id, path)
         except Exception as e:
             print(f"failed to download {ride_id} ({row.get('title')}): {e}")
+            if ride_id in pending:
+                pending.remove(ride_id)
+                del names[ride_id]
             continue
         new_files += 1
         print(f"downloaded {ride_id} {row.get('title')}")
@@ -214,7 +233,7 @@ def main():
     print(f"{new_files} new fit files")
     session.close()
     generator = Generator(SQL_FILE)
-    sync_fit_tracks(generator.session, names)
+    sync_fit_tracks(generator.session, names, pending)
     drop_seed_duplicates(generator.session)
     with open(JSON_FILE, "w") as f:
         json.dump(generator.load(), f, indent=0)
