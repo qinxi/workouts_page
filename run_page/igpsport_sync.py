@@ -4,24 +4,27 @@ Sync activities from iGPSPORT (China site) by downloading the original FIT files
 Usage:
     python run_page/igpsport_sync.py <username> <password> [--since YYYY-MM-DD]
 
-Activities older than the last one in the local db (seeded from
-run_page/seed_activities.json) are skipped so that history imported from Strava
-is not duplicated.
+Activities up to the last one in run_page/seed_activities.json (history
+imported from Strava) are kept from the seed; seeded rides that also exist as
+FIT files are replaced by the FIT version.
 """
 
 import argparse
 import datetime
 import json
 import os
+import sys
 import time
 
 import arrow
 import requests
 from config import FIT_FOLDER, JSON_FILE, SQL_FILE
-from generator.db import Activity, init_db
+from generator.db import Activity, init_db, update_or_create_activity
+from gpxtrackposter.track_loader import TrackLoader
 from sqlalchemy import func
 
 from generator import Generator
+from synced_data_file_logger import load_fit_name_mapping, save_fit_name_mapping
 
 BASE_URL = "https://prod.zh.igpsport.com/service/"
 LOGIN_URL = BASE_URL + "auth/account/login"
@@ -30,7 +33,9 @@ QUERY_URL = ACTIVITY_URL + "queryMyActivity"
 DOWNLOAD_URL = ACTIVITY_URL + "getDownloadUrl/"
 PAGE_SIZE = 20
 
-SEED_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "seed_activities.json")
+SEED_FILE = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "seed_activities.json"
+)
 
 
 def parse_interval(s):
@@ -42,7 +47,9 @@ def parse_interval(s):
         days = int(d.split()[0])
         s = s.strip()
     h, m, sec = s.split(":")
-    return datetime.timedelta(days=days, hours=int(h), minutes=int(m), seconds=float(sec))
+    return datetime.timedelta(
+        days=days, hours=int(h), minutes=int(m), seconds=float(sec)
+    )
 
 
 def seed_db(session, seed_file=SEED_FILE):
@@ -82,9 +89,7 @@ def drop_seed_duplicates(session, minutes=10):
     """Remove seeded (Strava) activities that are also covered by a FIT file."""
     rows = session.query(Activity).all()
     fits = [
-        arrow.get(a.start_date)
-        for a in rows
-        if a.source != "strava" and a.start_date
+        arrow.get(a.start_date) for a in rows if a.source != "strava" and a.start_date
     ]
     removed = 0
     for a in rows:
@@ -96,6 +101,19 @@ def drop_seed_duplicates(session, minutes=10):
             removed += 1
     session.commit()
     print(f"removed {removed} seeded activities duplicated by fit files")
+
+
+def sync_fit_tracks(session, names):
+    """Load the FIT files and save them, using the iGPSPORT titles as names."""
+    tracks = TrackLoader().load_tracks(FIT_FOLDER, file_suffix="fit")
+    for t in tracks:
+        ride_id = os.path.splitext(t.file_names[0])[0]
+        t.name = names.get(ride_id) or t.name
+        t.source = "igpsport"
+        created = update_or_create_activity(session, t.to_namedtuple())
+        sys.stdout.write("+" if created else ".")
+    sys.stdout.flush()
+    session.commit()
 
 
 class IGPSport:
@@ -158,24 +176,29 @@ def main():
     session = init_db(SQL_FILE)
     seed_db(session)
 
-    last_local = session.query(func.max(Activity.start_date_local)).scalar()
     if args.since:
         begin = args.since
-    elif last_local:
-        begin = arrow.get(last_local).shift(days=-1).format("YYYY-MM-DD")
     else:
-        begin = ""
+        # everything after the Strava-era history comes from iGPSPORT
+        last_seed = (
+            session.query(func.max(Activity.start_date_local))
+            .filter(Activity.source == "strava")
+            .scalar()
+        )
+        begin = (
+            arrow.get(last_seed).shift(days=-1).format("YYYY-MM-DD")
+            if last_seed
+            else ""
+        )
     print(f"syncing iGPSPORT activities since {begin or 'the beginning'}")
 
     client = IGPSport(args.username, args.password)
+    names = load_fit_name_mapping()
     new_files = 0
     for row in client.activities(begin_time=begin):
         ride_id = row["rideId"]
+        names[str(ride_id)] = row.get("title") or ""
         path = os.path.join(FIT_FOLDER, f"{ride_id}.fit")
-        start = str(row.get("startTime", ""))
-        # skip what is already covered by the Strava-era history
-        if last_local and not args.since and start and start <= last_local:
-            continue
         if os.path.exists(path):
             continue
         try:
@@ -184,12 +207,14 @@ def main():
             print(f"failed to download {ride_id} ({row.get('title')}): {e}")
             continue
         new_files += 1
-        print(f"downloaded {ride_id} {start} {row.get('title')}")
+        print(f"downloaded {ride_id} {row.get('title')}")
         time.sleep(0.5)
+    save_fit_name_mapping(names)
 
     print(f"{new_files} new fit files")
+    session.close()
     generator = Generator(SQL_FILE)
-    generator.sync_from_data_dir(FIT_FOLDER, file_suffix="fit")
+    sync_fit_tracks(generator.session, names)
     drop_seed_duplicates(generator.session)
     with open(JSON_FILE, "w") as f:
         json.dump(generator.load(), f, indent=0)
